@@ -168,7 +168,15 @@ jobs:
           import android.content.ClipboardManager
           import android.content.Context
           import android.content.Intent
+          import android.animation.Animator
+          import android.animation.AnimatorListenerAdapter
+          import android.animation.ValueAnimator
           import android.graphics.Color
+          import android.graphics.RenderEffect
+          import android.graphics.Shader
+          import android.graphics.drawable.GradientDrawable
+          import android.view.animation.DecelerateInterpolator
+          import android.view.animation.OvershootInterpolator
           import android.net.Uri
           import android.net.VpnService
           import android.os.Build
@@ -213,6 +221,11 @@ jobs:
               private var status: TextView? = null
               private var panelsJson: JSONArray = JSONArray()
               private var lastVpn = "off"
+              private var islandOpen = 0
+              private var newsItems = ArrayList<Pair<String, String>>()
+              private var newsRead = false
+              private var cfgOpen = false
+              private var curTab = -1
 
               private fun fa(n: Long): String = NumberFormat.getInstance(Locale("fa")).format(n)
               private fun bytes(b: Long): String {
@@ -285,7 +298,7 @@ jobs:
                   prefs.edit().remove("tok").apply()
                   Api.token = ""
                   if (VnetVpnService.state != "off") startService(Intent(this, VnetVpnService::class.java).setAction("stop"))
-                  services.clear(); cur = null; pages.clear(); cfgs.clear(); pick = "auto"; sel = 0
+                  services.clear(); cur = null; pages.clear(); cfgs.clear(); pick = "auto"; sel = 0; curTab = -1; islandOpen = 0; newsItems.clear()
                   host.removeAllViews()
                   showLogin()
               }
@@ -405,17 +418,49 @@ jobs:
 
               private fun selectTab(i: Int) {
                   for (k in 0..2) {
-                      val c = if (k == i) Theme.primary else Theme.muted
+                      val c = if (k == i) Color.parseColor("#6E9BFF") else Theme.muted
                       navIcons[k].color = c
                       navLabels[k].setTextColor(c)
                   }
                   val body = tabBody ?: return
-                  body.removeAllViews()
+                  while (body.childCount > 1) body.removeViewAt(0)
+                  val old = if (body.childCount > 0) body.getChildAt(0) else null
                   val v = if (i == 0) connTab() else if (i == 1) subTab() else accTab()
                   body.addView(v)
-                  v.alpha = 0f
-                  v.translationY = dp(14).toFloat()
-                  v.animate().alpha(1f).translationY(0f).setDuration(240).start()
+                  val dir = if (curTab < 0) 0 else if (i > curTab) 1 else if (i < curTab) -1 else 0
+                  curTab = i
+                  slideSwap(body, old, v, dir)
+              }
+
+              private fun blur(v: View, r: Float) {
+                  if (Build.VERSION.SDK_INT >= 31) v.setRenderEffect(if (r < 0.5f) null else RenderEffect.createBlurEffect(r, r, Shader.TileMode.CLAMP))
+              }
+
+              private fun slideSwap(body: FrameLayout, old: View?, v: View, dir: Int) {
+                  val w = (if (body.width > 0) body.width else resources.displayMetrics.widthPixels).toFloat()
+                  val a = ValueAnimator.ofFloat(0f, 1f)
+                  a.duration = 430
+                  a.interpolator = DecelerateInterpolator(1.6f)
+                  a.addUpdateListener {
+                      val f = it.animatedValue as Float
+                      v.alpha = f
+                      v.translationX = -dir * w * 0.35f * (1f - f)
+                      blur(v, 26f * (1f - f))
+                      if (old != null) {
+                          old.alpha = 1f - f
+                          old.translationX = dir * w * 0.35f * f
+                          blur(old, 26f * f)
+                      }
+                  }
+                  a.addListener(object : AnimatorListenerAdapter() {
+                      override fun onAnimationEnd(an: Animator) {
+                          v.alpha = 1f
+                          v.translationX = 0f
+                          blur(v, 0f)
+                          if (old != null) body.removeView(old)
+                      }
+                  })
+                  a.start()
               }
 
               private fun scrollCol(title: String): Pair<ScrollView, LinearLayout> {
@@ -457,7 +502,7 @@ jobs:
                       val a = r.getJSONArray("services")
                       for (i in 0 until a.length()) services.add(a.getJSONObject(i))
                       if (services.isNotEmpty() && services.none { it.getInt("id") == sel }) sel = services[0].getInt("id")
-                      if (services.isEmpty()) renderConn(body) else loadConfigs(body)
+                      if (services.isEmpty()) { cur = null; loadNews { renderConn(body) } } else loadConfigs(body)
                   }, { e -> retry(body, e) { loadServices(body) } })
               }
 
@@ -468,24 +513,156 @@ jobs:
                       val a = r.getJSONArray("configs")
                       for (i in 0 until a.length()) cfgs.add(Pair(a.getJSONObject(i).getString("id"), a.getJSONObject(i).getString("name")))
                       if (r.has("announcement")) ann = r.optString("announcement")
-                      renderConn(body)
+                      loadNews { renderConn(body) }
                   }, { e -> retry(body, e) { loadServices(body) } })
               }
 
               private fun stateInt(): Int = if (VnetVpnService.state == "on") 2 else if (VnetVpnService.state == "connecting") 1 else 0
 
+              private fun loadNews(done: () -> Unit) {
+                  Api.call("notifications", JSONObject(), false, { r ->
+                      newsItems.clear()
+                      newsRead = false
+                      val a = r.getJSONArray("items")
+                      for (i in 0 until a.length()) {
+                          val n = a.getJSONObject(i)
+                          if (n.optInt("is_read", 1) == 0) newsItems.add(Pair(n.getString("title"), n.getString("body")))
+                      }
+                      if (ann.isNotEmpty() && (prefs.getString("ann_seen", "") ?: "") != ann.hashCode().toString()) newsItems.add(0, Pair("اطلاعیه", ann))
+                      if (newsItems.isEmpty() && islandOpen == 1) islandOpen = 0
+                      done()
+                  }, { done() })
+              }
+
+              private fun infoSummary(): String {
+                  val c = cur ?: return "بدون سرویس"
+                  val rem = c.optLong("remaining", -1)
+                  return (if (rem < 0) "نامحدود" else bytes(rem)) + "  ·  " + left(c.optLong("seconds_left", -1))
+              }
+
+              private fun statusOk(): Boolean {
+                  val st = cur?.optString("status") ?: ""
+                  return st == "active" || st == "unknown" || st == "on_hold" || st == ""
+              }
+
+              private fun pill(label: String, dot: Int?, onClick: (View) -> Unit): TextView {
+                  val t = text(label, 13f, Color.WHITE, true)
+                  t.setPadding(dp(16), dp(10), dp(16), dp(10))
+                  t.gravity = Gravity.CENTER
+                  t.background = shape(Color.BLACK, dp(26).toFloat(), Color.argb(80, 255, 255, 255))
+                  if (dot != null) {
+                      val d = GradientDrawable()
+                      d.shape = GradientDrawable.OVAL
+                      d.setColor(dot)
+                      d.setSize(dp(8), dp(8))
+                      t.setCompoundDrawablesRelativeWithIntrinsicBounds(d, null, null, null)
+                      t.compoundDrawablePadding = dp(8)
+                  }
+                  t.setOnClickListener { onClick(t) }
+                  return t
+              }
+
+              private fun toggleIsland(zone: LinearLayout, which: Int, v: View) {
+                  val loc = IntArray(2)
+                  v.getLocationInWindow(loc)
+                  val cx = loc[0] + v.width / 2f
+                  islandOpen = if (islandOpen == which) 0 else which
+                  if (islandOpen == 1 && !newsRead) {
+                      newsRead = true
+                      Api.call("notifications", JSONObject().put("mark_read", true), false, { }, { })
+                      prefs.edit().putString("ann_seen", ann.hashCode().toString()).apply()
+                  }
+                  buildIsland(zone, cx)
+              }
+
+              private fun buildIsland(zone: LinearLayout, fromX: Float? = null) {
+                  zone.removeAllViews()
+                  val hasNews = newsItems.isNotEmpty()
+                  val hasInfo = cur != null
+                  if (!hasNews && !hasInfo) return
+                  val row = LinearLayout(this)
+                  row.orientation = LinearLayout.HORIZONTAL
+                  row.gravity = Gravity.CENTER_VERTICAL
+                  val newsLabel = if (newsRead) "اخبار" else fa(newsItems.size.toLong()) + " خبر نخوانده"
+                  val np = if (hasNews) pill(newsLabel, if (newsRead) null else Theme.accent) { v -> toggleIsland(zone, 1, v) } else null
+                  val ip = if (hasInfo) pill(infoSummary(), if (statusOk()) Theme.success else Theme.danger) { v -> toggleIsland(zone, 2, v) } else null
+                  val showNews = np != null && islandOpen != 1
+                  val showInfo = ip != null && islandOpen != 2
+                  if (showNews && np != null) row.addView(np, LinearLayout.LayoutParams(WRAP, WRAP))
+                  val gap = View(this)
+                  gap.setBackgroundColor(if (showNews && showInfo) Color.argb(40, 255, 255, 255) else Color.TRANSPARENT)
+                  val glp = LinearLayout.LayoutParams(0, 1, 1f)
+                  glp.marginStart = dp(10)
+                  glp.marginEnd = dp(10)
+                  row.addView(gap, glp)
+                  if (showInfo && ip != null) row.addView(ip, LinearLayout.LayoutParams(WRAP, WRAP))
+                  zone.addView(row, LinearLayout.LayoutParams(MATCH, WRAP))
+                  val pillView: View? = if (islandOpen == 1) ip else if (islandOpen == 2) np else null
+                  if (pillView != null) {
+                      pillView.alpha = 0f
+                      pillView.scaleX = 1.35f
+                      pillView.animate().alpha(1f).scaleX(1f).setDuration(320).setInterpolator(DecelerateInterpolator()).start()
+                  }
+                  if (islandOpen != 0) {
+                      val card = column(18)
+                      card.background = shape(Color.BLACK, dp(30).toFloat(), Color.argb(80, 255, 255, 255))
+                      if (islandOpen == 1) fillNews(card) else fillInfo(card)
+                      zone.add(card, MATCH, WRAP, 10)
+                      card.alpha = 0f
+                      card.scaleX = 0.5f
+                      card.scaleY = 0.25f
+                      card.post {
+                          var px = card.width / 2f
+                          if (fromX != null) {
+                              val b = IntArray(2)
+                              card.getLocationInWindow(b)
+                              px = fromX - b[0]
+                          }
+                          card.pivotX = px
+                          card.pivotY = 0f
+                          card.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(440).setInterpolator(OvershootInterpolator(0.8f)).start()
+                      }
+                  }
+              }
+
+              private fun fillNews(card: LinearLayout) {
+                  card.addView(text("اخبار", 16f, Theme.text, true))
+                  if (newsItems.isEmpty()) card.add(text("خبری نیست", 13f, Theme.muted), WRAP, WRAP, 8)
+                  for (n in newsItems) {
+                      card.add(text(n.first, 14f, Theme.text, true), MATCH, WRAP, 14)
+                      card.add(text(n.second, 13f, Theme.muted), MATCH, WRAP, 4)
+                  }
+              }
+
+              private fun fillInfo(card: LinearLayout) {
+                  val c = cur ?: return
+                  card.addView(text("اطلاعات سرویس", 16f, Theme.text, true))
+                  val st = c.optString("status")
+                  val label = if (statusOk()) "فعال" else if (st == "expired") "منقضی" else if (st == "limited") "اتمام حجم" else if (st == "disabled") "غیرفعال" else st
+                  card.addView(kv("سرویس", c.optString("plan_name").ifEmpty { "سرویس" } + if (c.optBoolean("is_test")) " (تست)" else ""))
+                  card.addView(kv("وضعیت", label, if (statusOk()) Theme.success else Theme.danger))
+                  val rem = c.optLong("remaining", -1)
+                  card.addView(kv("حجم باقی‌مانده", if (rem < 0) "نامحدود" else bytes(rem)))
+                  val lim = c.optLong("limit", 0)
+                  if (lim > 0) {
+                      card.add(bar((c.optLong("used", 0) * 100 / lim).toInt()), MATCH, WRAP, 2)
+                      card.addView(kv("مصرف‌شده", bytes(c.optLong("used", 0)) + " از " + bytes(lim)))
+                  }
+                  card.addView(kv("زمان باقی‌مانده", left(c.optLong("seconds_left", -1))))
+                  val ex = c.optLong("expire", 0)
+                  if (ex > 0) card.addView(kv("تاریخ انقضا", date(ex)))
+              }
+
               private fun renderConn(body: LinearLayout) {
                   body.removeAllViews()
-                  if (ann.isNotEmpty()) {
-                      val c = card()
-                      c.addView(text("📢 $ann"))
-                      body.add(c, MATCH, WRAP, 0)
-                  }
+                  val zone = column()
+                  body.add(zone, MATCH, WRAP, 0)
+                  buildIsland(zone)
                   if (services.isEmpty()) {
                       val c = card()
                       c.addView(text("هنوز اشتراکی ندارید.", 14f, Theme.muted))
-                      c.add(button("خرید یا دریافت تست") { selectTab(1) }, MATCH, WRAP, 14)
-                      body.add(c, MATCH, WRAP, 12)
+                      c.add(button("خرید پلن", "accent") { selectTab(1) }, MATCH, WRAP, 16)
+                      body.add(c, MATCH, WRAP, 16)
                       return
                   }
                   if (services.size > 1) {
@@ -503,53 +680,74 @@ jobs:
                           row.addView(chip, lp)
                       }
                       hs.addView(row)
-                      body.add(hs, MATCH, WRAP, 12)
+                      body.add(hs, MATCH, WRAP, 16)
                   }
                   val pw = PowerView(this)
                   pw.st = stateInt()
                   pw.setOnClickListener { toggleVpn() }
                   power = pw
-                  val lp = LinearLayout.LayoutParams(dp(230), dp(230))
+                  val lp = LinearLayout.LayoutParams(dp(250), dp(250))
                   lp.gravity = Gravity.CENTER_HORIZONTAL
-                  lp.topMargin = dp(8)
+                  lp.topMargin = dp(10)
                   body.addView(pw, lp)
-                  val st = text("", 15f, Theme.text, true)
+                  val st = text("", 16f, Theme.text, true)
                   st.gravity = Gravity.CENTER
                   status = st
                   body.add(st, MATCH, WRAP, 0)
                   onVpn()
 
                   val c = cur
-                  if (c != null) {
-                      val u = card()
-                      val ok = c.optString("status").let { it == "active" || it == "unknown" || it == "on_hold" }
-                      u.addView(kv("وضعیت", if (ok) "فعال" else c.optString("status"), if (ok) Theme.success else Theme.danger))
-                      val rem = c.optLong("remaining", -1)
-                      u.addView(kv("حجم باقی‌مانده", if (rem < 0) "نامحدود" else bytes(rem)))
-                      val lim = c.optLong("limit", 0)
-                      if (lim > 0) u.add(bar((c.optLong("used", 0) * 100 / lim).toInt()), MATCH, WRAP, 2)
-                      u.addView(kv("زمان باقی‌مانده", left(c.optLong("seconds_left", -1))))
-                      body.add(u, MATCH, WRAP, 16)
+                  if (c != null && !statusOk()) {
+                      val hc = card()
+                      hc.addView(text(if (c.optBoolean("is_test")) "زمان تست شما تمام شد. برای ادامه از بخش اشتراک پلن بخرید." else "این سرویس منقضی یا تمام شده است؛ آن را تمدید کنید.", 14f, Theme.text))
+                      hc.add(button("مشاهده پلن‌ها", "accent") { selectTab(1) }, MATCH, WRAP, 14)
+                      body.add(hc, MATCH, WRAP, 18)
                   }
+
                   val lc = card()
+                  val sel0 = cfgs.firstOrNull { it.first == pick }
                   val head = LinearLayout(this)
                   head.gravity = Gravity.CENTER_VERTICAL
-                  head.addView(text("کانفیگ‌ها", 16f, Theme.text, true), LinearLayout.LayoutParams(0, WRAP, 1f))
-                  head.addView(button("بروزرسانی", "ghost") { loadServices(body); toast("در حال بروزرسانی…") }, LinearLayout.LayoutParams(WRAP, WRAP))
+                  val gi = IconView(this, 3)
+                  gi.color = Theme.text
+                  head.addView(gi, LinearLayout.LayoutParams(dp(30), dp(30)))
+                  val tc = column()
+                  tc.setPadding(dp(14), 0, dp(14), 0)
+                  tc.addView(text(if (sel0 == null) "اتصال خودکار" else sel0.second, 15f, Theme.text, true))
+                  tc.addView(text(if (sel0 == null) "سریع‌ترین کانفیگ انتخاب می‌شود" else "انتخاب دستی", 12f, Theme.muted))
+                  head.addView(tc, LinearLayout.LayoutParams(0, WRAP, 1f))
+                  val chev = text("⌄", 22f, Theme.muted)
+                  chev.rotation = if (cfgOpen) 180f else 0f
+                  head.addView(chev)
                   lc.addView(head)
-                  lc.add(cfgRow("auto", "اتصال خودکار", "سریع‌ترین کانفیگ انتخاب می‌شود"), MATCH, WRAP, 8)
-                  for (p in cfgs) lc.add(cfgRow(p.first, p.second, ""), MATCH, WRAP, 8)
-                  body.add(lc, MATCH, WRAP, 16)
+                  val list = column()
+                  list.visibility = if (cfgOpen) View.VISIBLE else View.GONE
+                  list.add(cfgRow("auto", "اتصال خودکار", "سریع‌ترین کانفیگ انتخاب می‌شود"), MATCH, WRAP, 14)
+                  for (p in cfgs) list.add(cfgRow(p.first, p.second, ""), MATCH, WRAP, 10)
+                  list.add(button("بروزرسانی کانفیگ‌ها", "ghost") { loadServices(body); toast("در حال بروزرسانی…") }, MATCH, WRAP, 12)
+                  lc.addView(list)
+                  head.setOnClickListener {
+                      cfgOpen = !cfgOpen
+                      if (cfgOpen) {
+                          list.visibility = View.VISIBLE
+                          list.alpha = 0f
+                          list.animate().alpha(1f).setDuration(260).start()
+                      } else {
+                          list.visibility = View.GONE
+                      }
+                      chev.animate().rotation(if (cfgOpen) 180f else 0f).setDuration(260).start()
+                  }
+                  body.add(lc, MATCH, WRAP, 18)
               }
 
               private fun cfgRow(id: String, name: String, sub: String): View {
                   val on = pick == id || (id == "auto" && cfgs.none { it.first == pick })
                   val r = LinearLayout(this)
                   r.gravity = Gravity.CENTER_VERTICAL
-                  r.setPadding(dp(14), dp(12), dp(14), dp(12))
+                  r.setPadding(dp(14), dp(14), dp(14), dp(14))
                   r.background = if (on) selBg(this) else glass(this, 14, 0x14, 0x06, 0x28)
                   val dot = View(this)
-                  dot.background = shape(if (on) Theme.primary else Color.TRANSPARENT, dp(8).toFloat(), if (on) Theme.primary else Theme.muted, 2)
+                  dot.background = shape(if (on) Theme.primary else Color.TRANSPARENT, dp(8).toFloat(), if (on) Color.argb(200, 120, 160, 240) else Theme.muted, 2)
                   val dl = LinearLayout.LayoutParams(dp(16), dp(16))
                   dl.marginEnd = dp(12)
                   r.addView(dot, dl)
@@ -651,7 +849,7 @@ jobs:
                           row.gravity = Gravity.CENTER_VERTICAL
                           row.addView(text(pl.getString("name"), 14f, Theme.text, true), LinearLayout.LayoutParams(0, WRAP, 1f))
                           val isTest = pl.getBoolean("is_test")
-                          val b = button(if (isTest) "دریافت تست" else planLabel(pl, "خرید"), if (isTest) "ghost" else "primary") {
+                          val b = button(if (isTest) "دریافت تست" else planLabel(pl, "خرید"), if (isTest) "ghost" else "accent") {
                               if (isTest) buyPlan("test", pl) else confirmBuy(pl)
                           }
                           if (isTest && !pl.optBoolean("test_available", true)) b.alpha = 0.4f
@@ -751,7 +949,7 @@ jobs:
                       chips.addView(ch, lp)
                   }
                   c2.add(chips, MATCH, WRAP, 10)
-                  c2.add(button("پرداخت") { topup(amt.text.toString()) }, MATCH, WRAP, 12)
+                  c2.add(button("پرداخت", "accent") { topup(amt.text.toString()) }, MATCH, WRAP, 14)
                   if (!u.optBoolean("tg_linked")) {
                       c2.add(text("برای پرداخت، تلگرام باید به حساب وصل باشد.", 12f, Theme.muted), WRAP, WRAP, 12)
                       c2.add(button("اتصال تلگرام", "ghost") { linkTg() }, MATCH, WRAP, 6)
@@ -1014,7 +1212,8 @@ jobs:
                       try {
                           startAll(cfg)
                       } catch (e: Throwable) {
-                          lastError = e.message ?: e.toString()
+                          lastError = e.toString() + (e.cause?.let { " | " + it.toString() } ?: "")
+                          Report.logError(applicationContext, e)
                           stopAll()
                       }
                   }.start()
@@ -1154,7 +1353,8 @@ jobs:
               val field = Color.parseColor("#0E0E0E")
               val muted = Color.parseColor("#8C8C8C")
               val text = Color.parseColor("#F2F2F2")
-              val primary = Color.parseColor("#5C8FD6")
+              val primary = Color.parseColor("#2F5FC4")
+              val accent = Color.parseColor("#F0A468")
               val success = Color.parseColor("#22C55E")
               val danger = Color.parseColor("#EF4444")
               val warn = Color.parseColor("#F59E0B")
@@ -1176,6 +1376,7 @@ jobs:
               t.textSize = size
               t.setTextColor(color)
               if (bold) t.setTypeface(t.typeface, Typeface.BOLD)
+              t.setLineSpacing(0f, 1.3f)
               return t
           }
 
@@ -1194,21 +1395,28 @@ jobs:
           }
 
           fun primaryBg(ctx: Context, r: Int = 14): GradientDrawable {
-              val g = GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(Color.parseColor("#7FB0FF"), Color.parseColor("#4676CC")))
+              val g = GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(Color.parseColor("#3F70DA"), Color.parseColor("#1F428F")))
+              g.cornerRadius = ctx.dp(r).toFloat()
+              g.setStroke(1, Color.argb(0x66, 255, 255, 255))
+              return g
+          }
+
+          fun accentBg(ctx: Context, r: Int = 14): GradientDrawable {
+              val g = GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(Color.parseColor("#F2AE76"), Color.parseColor("#D2803F")))
               g.cornerRadius = ctx.dp(r).toFloat()
               g.setStroke(1, Color.argb(0x66, 255, 255, 255))
               return g
           }
 
           fun selBg(ctx: Context, r: Int = 14): GradientDrawable {
-              val g = GradientDrawable(GradientDrawable.Orientation.TL_BR, intArrayOf(Color.argb(0x66, 92, 143, 214), Color.argb(0x22, 92, 143, 214)))
+              val g = GradientDrawable(GradientDrawable.Orientation.TL_BR, intArrayOf(Color.argb(0x77, 47, 95, 196), Color.argb(0x28, 47, 95, 196)))
               g.cornerRadius = ctx.dp(r).toFloat()
-              g.setStroke(1, Color.argb(0xAA, 124, 170, 240))
+              g.setStroke(1, Color.argb(0xAA, 90, 130, 225))
               return g
           }
 
           fun Context.card(): LinearLayout {
-              val l = column(16)
+              val l = column(18)
               l.background = glass(this, 22)
               return l
           }
@@ -1220,7 +1428,7 @@ jobs:
               return f
           }
 
-          fun LinearLayout.add(v: View, w: Int = MATCH, h: Int = WRAP, top: Int = 12): View {
+          fun LinearLayout.add(v: View, w: Int = MATCH, h: Int = WRAP, top: Int = 14): View {
               val lp = LinearLayout.LayoutParams(w, h)
               lp.topMargin = context.dp(top)
               addView(v, lp)
@@ -1228,7 +1436,7 @@ jobs:
           }
 
           fun Context.button(label: String, kind: String = "primary", onClick: () -> Unit): TextView {
-              val solid = kind == "primary" || kind == "danger"
+              val solid = kind == "primary" || kind == "danger" || kind == "accent"
               val t = text(label, 14f, if (solid) Color.WHITE else Theme.text, true)
               t.gravity = Gravity.CENTER
               t.minHeight = dp(46)
@@ -1239,7 +1447,7 @@ jobs:
                   "ghost" -> Color.TRANSPARENT
                   else -> Theme.card
               }
-              t.background = if (kind == "primary") primaryBg(this) else if (kind == "danger") shape(Color.parseColor("#C93C3C"), dp(14).toFloat(), Color.argb(0x66, 255, 255, 255)) else glass(this, 14, 0x24, 0x0A, 0x33)
+              t.background = if (kind == "primary") primaryBg(this) else if (kind == "accent") accentBg(this) else if (kind == "danger") shape(Color.parseColor("#C93C3C"), dp(14).toFloat(), Color.argb(0x66, 255, 255, 255)) else glass(this, 14, 0x24, 0x0A, 0x33)
               t.setOnClickListener { onClick() }
               t.setOnTouchListener { v, e ->
                   if (e.action == MotionEvent.ACTION_DOWN) {
@@ -1268,7 +1476,7 @@ jobs:
               val r = LinearLayout(this)
               r.orientation = LinearLayout.HORIZONTAL
               r.gravity = Gravity.CENTER_VERTICAL
-              r.setPadding(0, dp(8), 0, dp(8))
+              r.setPadding(0, dp(10), 0, dp(10))
               val a = text(k, 14f, Theme.muted)
               val b = text(v, 14f, vColor, true)
               r.addView(a, LinearLayout.LayoutParams(0, WRAP, 1f))
@@ -1290,21 +1498,28 @@ jobs:
           }
 
           class PowerView(c: Context) : View(c) {
-              var st: Int = 0
+              private var stv = 0
+              var st: Int
+                  get() = stv
                   set(v) {
-                      field = v
+                      val old = stv
+                      stv = v
                       if (v != 0) startAnim() else stopAnim()
+                      if (v == 2 && old == 1) startBurst()
                       invalidate()
                   }
               private val p = Paint(Paint.ANTI_ALIAS_FLAG)
               private var t = 0f
+              private var burst = -1f
               private var anim: ValueAnimator? = null
+              private var burstAnim: ValueAnimator? = null
 
               private fun startAnim() {
                   if (anim?.isRunning == true) return
                   val a = ValueAnimator.ofFloat(0f, 1f)
                   a.duration = 1700
                   a.repeatCount = ValueAnimator.INFINITE
+                  a.interpolator = LinearInterpolator()
                   a.addUpdateListener { t = it.animatedValue as Float; invalidate() }
                   anim = a
                   a.start()
@@ -1316,8 +1531,26 @@ jobs:
                   t = 0f
               }
 
+              private fun startBurst() {
+                  burstAnim?.cancel()
+                  burst = 0f
+                  val a = ValueAnimator.ofFloat(0f, 1f)
+                  a.duration = 950
+                  a.interpolator = android.view.animation.DecelerateInterpolator()
+                  a.addUpdateListener { burst = it.animatedValue as Float; invalidate() }
+                  a.addListener(object : AnimatorListenerAdapter() {
+                      override fun onAnimationEnd(an: Animator) {
+                          burst = -1f
+                          invalidate()
+                      }
+                  })
+                  burstAnim = a
+                  a.start()
+              }
+
               override fun onDetachedFromWindow() {
                   stopAnim()
+                  burstAnim?.cancel()
                   super.onDetachedFromWindow()
               }
 
@@ -1329,9 +1562,21 @@ jobs:
               override fun onDraw(cv: Canvas) {
                   val cx = width / 2f
                   val cy = height / 2f
-                  val r = minOf(cx, cy) * 0.6f
-                  val col = if (st == 2) Theme.success else if (st == 1) Theme.primary else Color.parseColor("#262626")
-                  if (st != 0) {
+                  val r = minOf(cx, cy) * 0.52f
+                  val col = if (stv == 2) Theme.success else if (stv == 1) Theme.primary else Color.parseColor("#262626")
+                  if (stv == 1) {
+                      val rr = r * 1.32f
+                      val rect = RectF(cx - rr, cy - rr, cx + rr, cy + rr)
+                      p.style = Paint.Style.STROKE
+                      p.strokeCap = Paint.Cap.ROUND
+                      p.strokeWidth = 6f
+                      p.color = Color.parseColor("#6E9BFF")
+                      p.alpha = 255
+                      cv.drawArc(rect, t * 720f, 100f, false, p)
+                      p.alpha = 120
+                      cv.drawArc(rect, t * 720f + 180f, 60f, false, p)
+                  }
+                  if (stv != 0) {
                       for (k in 0..1) {
                           val f = (t + k * 0.5f) % 1f
                           p.style = Paint.Style.STROKE
@@ -1348,10 +1593,25 @@ jobs:
                   p.style = Paint.Style.STROKE
                   p.strokeWidth = r * 0.13f
                   p.strokeCap = Paint.Cap.ROUND
-                  p.color = if (st == 0) Color.parseColor("#8C8C8C") else Color.WHITE
+                  p.color = if (stv == 0) Color.parseColor("#8C8C8C") else Color.WHITE
                   val ir = r * 0.42f
                   cv.drawArc(RectF(cx - ir, cy - ir, cx + ir, cy + ir), -50f, 280f, false, p)
                   cv.drawLine(cx, cy - ir * 1.15f, cx, cy - ir * 0.1f, p)
+                  if (burst >= 0f) {
+                      val f = burst
+                      p.style = Paint.Style.STROKE
+                      p.strokeWidth = 5f
+                      p.color = Theme.success
+                      p.alpha = ((1f - f) * 200).toInt()
+                      cv.drawCircle(cx, cy, r * (1f + 1.1f * f), p)
+                      p.style = Paint.Style.FILL
+                      for (k in 0 until 14) {
+                          val a = Math.toRadians(k * (360.0 / 14))
+                          val d = r * (1.15f + 1.0f * f)
+                          p.alpha = ((1f - f) * 255).toInt()
+                          cv.drawCircle(cx + (Math.cos(a) * d).toFloat(), cy + (Math.sin(a) * d).toFloat(), 5f * (1f - f) + 1f, p)
+                      }
+                  }
               }
           }
 
@@ -1378,6 +1638,15 @@ jobs:
                       val b = android.graphics.Path()
                       b.moveTo(w * 0.1f, h * 0.55f); b.lineTo(w * 0.5f, h * 0.77f); b.lineTo(w * 0.9f, h * 0.55f)
                       cv.drawPath(b, p)
+                  } else if (kind == 3) {
+                      val cx = w / 2f
+                      val cy = h / 2f
+                      val r = w * 0.4f
+                      cv.drawCircle(cx, cy, r, p)
+                      cv.drawOval(RectF(cx - r * 0.42f, cy - r, cx + r * 0.42f, cy + r), p)
+                      cv.drawLine(cx - r, cy, cx + r, cy, p)
+                      cv.drawLine(cx - r * 0.86f, cy - r * 0.5f, cx + r * 0.86f, cy - r * 0.5f, p)
+                      cv.drawLine(cx - r * 0.86f, cy + r * 0.5f, cx + r * 0.86f, cy + r * 0.5f, p)
                   } else {
                       cv.drawCircle(w * 0.5f, h * 0.32f, w * 0.18f, p)
                       cv.drawArc(RectF(w * 0.18f, h * 0.58f, w * 0.82f, h * 1.2f), 180f, 180f, false, p)
@@ -1461,13 +1730,14 @@ jobs:
               private val p = Paint(Paint.ANTI_ALIAS_FLAG)
               private var t = phase
               private var anim: ValueAnimator? = null
-              private val cols = intArrayOf(Color.parseColor("#3D6FE8"), Color.parseColor("#8B3FE8"), Color.parseColor("#0FB9B1"), Color.parseColor("#E8743D"))
+              private val cols = intArrayOf(Color.parseColor("#1F46B8"), Color.parseColor("#12327F"), Color.parseColor("#0D2468"), Color.parseColor("#B4601F"))
+              private val alphas = intArrayOf(140, 125, 120, 42)
               private var shaders: Array<RadialGradient>? = null
               private var rad = 0f
 
               override fun onSizeChanged(w: Int, h: Int, ow: Int, oh: Int) {
                   rad = maxOf(w, h) * 0.55f
-                  shaders = Array(4) { i -> RadialGradient(0f, 0f, rad, Color.argb(120, Color.red(cols[i]), Color.green(cols[i]), Color.blue(cols[i])), Color.TRANSPARENT, Shader.TileMode.CLAMP) }
+                  shaders = Array(4) { i -> RadialGradient(0f, 0f, rad, Color.argb(alphas[i], Color.red(cols[i]), Color.green(cols[i]), Color.blue(cols[i])), Color.TRANSPARENT, Shader.TileMode.CLAMP) }
               }
 
               override fun onAttachedToWindow() {
@@ -1837,6 +2107,13 @@ jobs:
                   }
               }
 
+              fun logError(ctx: Context, e: Throwable) {
+                  try {
+                      File(ctx.filesDir, "last_error.txt").writeText(SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date()) + "\n" + android.util.Log.getStackTraceString(e))
+                  } catch (x: Exception) {
+                  }
+              }
+
               private fun tail(f: File, n: Int): String = try { if (f.exists()) f.readText().takeLast(n) else "" } catch (e: Exception) { "" }
 
               fun previousDied(ctx: Context): Boolean {
@@ -1849,7 +2126,7 @@ jobs:
               }
 
               fun clear(ctx: Context) {
-                  for (n in arrayOf("crash.txt", "xray.log", "hev.log")) File(ctx.filesDir, n).delete()
+                  for (n in arrayOf("crash.txt", "last_error.txt", "xray.log", "hev.log")) File(ctx.filesDir, n).delete()
               }
 
               fun build(ctx: Context): String {
@@ -1857,6 +2134,8 @@ jobs:
                   sb.append("Android ").append(Build.VERSION.SDK_INT).append(" / ").append(Build.MANUFACTURER).append(" ").append(Build.MODEL).append(" / ").append(Build.SUPPORTED_ABIS.joinToString(",")).append("\n")
                   val crash = File(ctx.filesDir, "crash.txt")
                   if (crash.exists()) sb.append("\n--- crash ---\n").append(tail(crash, 2500))
+                  val le = File(ctx.filesDir, "last_error.txt")
+                  if (le.exists()) sb.append("\n--- connect error ---\n").append(tail(le, 2000))
                   if (Build.VERSION.SDK_INT >= 30) {
                       try {
                           val am = ctx.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
@@ -1931,6 +2210,7 @@ jobs:
               init { System.loadLibrary("hev-socks5-tunnel") }
               @JvmStatic external fun TProxyStartService(configPath: String, fd: Int)
               @JvmStatic external fun TProxyStopService()
+              @JvmStatic external fun TProxyGetStats(): LongArray?
           }
           EOF2
           cat > android/app/src/main/java/com/vnet/app/TunBridge.kt <<EOF2
